@@ -60,14 +60,43 @@ enum ScreenHelper {
         return nil
     }
 
-    static func windowBounds(windowID: CGWindowID) -> CGRect? {
+    static func windowBounds(windowID: CGWindowID, pid: pid_t) -> CGRect? {
         guard let list = CGWindowListCopyWindowInfo([.optionIncludingWindow], windowID) as? [[String: Any]],
-              let info = list.first,
+              let info = list.first(where: {
+                  ($0[kCGWindowNumber as String] as? CGWindowID) == windowID &&
+                  ($0[kCGWindowOwnerPID as String] as? pid_t) == pid
+              }),
               let boundsDict = info[kCGWindowBounds as String] as? [String: Any],
               let bounds = CGRect(dictionaryRepresentation: boundsDict as CFDictionary) else {
             return nil
         }
         return bounds
+    }
+}
+
+private enum BackgroundMouseEvent {
+    // 这两个 WindowServer 字段没有公开的 CGEventField 名称。
+    private static let windowNumber = unsafeBitCast(UInt32(51), to: CGEventField.self)
+    private static let clickGroup = unsafeBitCast(UInt32(58), to: CGEventField.self)
+
+    private typealias SetWindowLocation = @convention(c) (CGEvent, CGPoint) -> Void
+    private static let setWindowLocation: SetWindowLocation? = {
+        guard let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "CGEventSetWindowLocation") else {
+            return nil
+        }
+        return unsafeBitCast(symbol, to: SetWindowLocation.self)
+    }()
+
+    static func stamp(_ event: CGEvent, pid: pid_t, windowID: CGWindowID, windowPoint: CGPoint, group: Int64) {
+        let id = Int64(windowID)
+        event.setIntegerValueField(windowNumber, value: id)
+        event.setIntegerValueField(clickGroup, value: group)
+        event.setIntegerValueField(.mouseEventWindowUnderMousePointer, value: id)
+        event.setIntegerValueField(.mouseEventWindowUnderMousePointerThatCanHandleThisEvent, value: id)
+        event.setIntegerValueField(.eventTargetUnixProcessID, value: Int64(pid))
+        event.setIntegerValueField(.mouseEventSubtype, value: Int64(NSEvent.EventSubtype.touch.rawValue))
+        event.setIntegerValueField(.mouseEventClickState, value: event.type == .mouseMoved ? 0 : 1)
+        setWindowLocation?(event, windowPoint)
     }
 }
 
@@ -228,7 +257,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var targetWindowID: CGWindowID = 0
     private var relX: CGFloat = 0
     private var relY: CGFloat = 0
-    private var fallbackScreenPt: CGPoint = .zero
 
     // 运行状态
     private var isRunning = false
@@ -416,7 +444,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let statusBox = NSBox(frame: NSRect(x: 14, y: 34, width: 422, height: 40))
         statusBox.titlePosition = .noTitle
         lblStatus = makeLabel("状态：待机（请按 F8 锁定目标）", frame: NSRect(x: 8, y: 8, width: 278, height: 20), size: 12.5, color: .secondaryLabelColor)
-        lblClicks = makeLabel("已点：0 次", frame: NSRect(x: 290, y: 8, width: 118, height: 20), size: 12.5, align: .right)
+        lblClicks = makeLabel("已发送：0 次", frame: NSRect(x: 290, y: 8, width: 118, height: 20), size: 12.5, align: .right)
         lblClicks.font = NSFont.boldSystemFont(ofSize: 12.5)
         statusBox.contentView?.addSubview(lblStatus)
         statusBox.contentView?.addSubview(lblClicks)
@@ -448,8 +476,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     // MARK: - 权限检查
     private func checkAccessibilityPermission(prompt: Bool) {
-        let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: prompt] as CFDictionary
-        let trusted = AXIsProcessTrustedWithOptions(opts)
+        let trusted = prompt ? CGRequestPostEventAccess() : CGPreflightPostEventAccess()
         if trusted {
             lblPerm.stringValue = "辅助功能权限：已授权"
             lblPerm.textColor = .systemGreen
@@ -528,7 +555,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         targetWindowID = hit.windowID
         relX = rx
         relY = ry
-        fallbackScreenPt = cgPt
         stateLock.unlock()
 
         let titleText = hit.windowTitle.isEmpty ? "(窗口 ID: \(hit.windowID))" : hit.windowTitle
@@ -543,22 +569,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
-    private func currentTargetCGPoint() -> (pid: pid_t, point: CGPoint, alive: Bool) {
+    private func currentTarget() -> (pid: pid_t, windowID: CGWindowID, screenPoint: CGPoint, windowPoint: CGPoint)? {
         stateLock.lock()
         let pid = targetPID
         let wid = targetWindowID
         let rx = relX
         let ry = relY
-        let fallback = fallbackScreenPt
         stateLock.unlock()
 
-        if pid == 0 { return (0, .zero, false) }
-        if let bounds = ScreenHelper.windowBounds(windowID: wid) {
-            return (pid, CGPoint(x: bounds.origin.x + rx, y: bounds.origin.y + ry), true)
-        }
-        // 检查进程是否还存活
-        let alive = (kill(pid, 0) == 0)
-        return (pid, fallback, alive)
+        guard pid != 0, let bounds = ScreenHelper.windowBounds(windowID: wid, pid: pid) else { return nil }
+        return (pid, wid,
+                CGPoint(x: bounds.minX + rx, y: bounds.minY + ry),
+                CGPoint(x: rx, y: ry))
     }
 
     private func syncMarkerAndPermission() {
@@ -569,9 +591,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return
         }
 
-        let target = currentTargetCGPoint()
-        if target.pid != 0 && target.alive {
-            markerWindow.moveToCGPoint(target.point)
+        if let target = currentTarget() {
+            markerWindow.moveToCGPoint(target.screenPoint)
             if !markerWindow.isVisible {
                 markerWindow.orderFrontRegardless()
             }
@@ -582,13 +603,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     // MARK: - 连点启停控制
     private func toggleStartPause() {
-        let target = currentTargetCGPoint()
-        if target.pid == 0 || !target.alive {
+        if currentTarget() == nil {
             setStatus("尚未锁定有效目标，请先指到目标按 F8", color: .systemRed)
             return
         }
 
-        if !AXIsProcessTrusted() {
+        if !CGPreflightPostEventAccess() {
             checkAccessibilityPermission(prompt: true)
             setStatus("请先在系统设置中授予「辅助功能」权限", color: .systemRed)
             return
@@ -620,7 +640,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         isRunning = true
         isPaused = false
         clickCount = 0
-        lblClicks.stringValue = "已点：0 次"
+        lblClicks.stringValue = "已发送：0 次"
         btnStartPause.title = "暂停 (F9)"
         btnStop.isEnabled = true
         setEditable(false)
@@ -664,8 +684,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func workerLoop(intervalMs: Int, jitterMs: Int, holdMs: Int,
                             maxCount: Int64, rightBtn: Bool, globalMode: Bool) {
         let downType: CGEventType = rightBtn ? .rightMouseDown : .leftMouseDown
-        let upType: CGEventType   = rightBtn ? .rightMouseUp   : .leftMouseUp
-        let btn: CGMouseButton    = rightBtn ? .right          : .left
+        let upType: CGEventType = rightBtn ? .rightMouseUp : .leftMouseUp
+        let btn: CGMouseButton = rightBtn ? .right : .left
+        let source = globalMode ? CGEventSource(stateID: .hidSystemState) : nil
 
         while isRunning {
             if isPaused {
@@ -673,45 +694,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 continue
             }
 
-            let target = currentTargetCGPoint()
-            if target.pid == 0 || !target.alive {
+            guard let target = currentTarget() else {
                 stopClicking(reason: "目标窗口已关闭，自动停止")
                 break
             }
 
-            let pt = target.point
-            if let src = CGEventSource(stateID: .hidSystemState) {
-                let moveEv = CGEvent(mouseEventSource: src, mouseType: .mouseMoved, mouseCursorPosition: pt, mouseButton: btn)
-                let downEv = CGEvent(mouseEventSource: src, mouseType: downType, mouseCursorPosition: pt, mouseButton: btn)
-                let upEv   = CGEvent(mouseEventSource: src, mouseType: upType, mouseCursorPosition: pt, mouseButton: btn)
-                downEv?.setIntegerValueField(.mouseEventClickState, value: 1)
-                upEv?.setIntegerValueField(.mouseEventClickState, value: 1)
+            func makeEvent(_ type: CGEventType) -> CGEvent? {
+                CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: target.screenPoint, mouseButton: btn)
+            }
 
+            guard let down = makeEvent(downType), let up = makeEvent(upType) else {
+                stopClicking(reason: "无法创建鼠标事件，已停止")
+                break
+            }
+            let group = Int64.random(in: 1...Int64(Int32.max))
+            func post(_ event: CGEvent) {
+                // 抬起事件在按住结束后投递，时间戳应反映实际投递顺序。
+                event.timestamp = DispatchTime.now().uptimeNanoseconds
                 if globalMode {
-                    moveEv?.post(tap: .cghidEventTap)
-                    downEv?.post(tap: .cghidEventTap)
+                    event.setIntegerValueField(.mouseEventClickState, value: event.type == .mouseMoved ? 0 : 1)
+                    event.post(tap: .cghidEventTap)
                 } else {
-                    moveEv?.postToPid(target.pid)
-                    downEv?.postToPid(target.pid)
-                }
-
-                if holdMs > 0 {
-                    _ = wakeSem.wait(timeout: .now() + .milliseconds(holdMs))
-                }
-
-                if globalMode {
-                    upEv?.post(tap: .cghidEventTap)
-                } else {
-                    upEv?.postToPid(target.pid)
+                    BackgroundMouseEvent.stamp(event, pid: target.pid, windowID: target.windowID,
+                                               windowPoint: target.windowPoint, group: group)
+                    event.postToPid(target.pid)
                 }
             }
+
+            if let move = makeEvent(.mouseMoved) { post(move) }
+            post(down)
+            if holdMs > 0 {
+                _ = wakeSem.wait(timeout: .now() + .milliseconds(holdMs))
+            }
+            post(up)
 
             if !isRunning { break }
 
             clickCount += 1
             let currentCount = clickCount
             DispatchQueue.main.async { [weak self] in
-                self?.lblClicks.stringValue = "已点：\(currentCount) 次"
+                self?.lblClicks.stringValue = "已发送：\(currentCount) 次"
             }
 
             if maxCount > 0 && currentCount >= maxCount {
