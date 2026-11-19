@@ -1,4 +1,6 @@
 *.exe
+*.app/
+*.zip
 *.pdb
 *.user
 *.suo
