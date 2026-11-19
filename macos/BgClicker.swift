@@ -100,6 +100,101 @@ private enum BackgroundMouseEvent {
     }
 }
 
+private struct BackgroundWindowFocus {
+    private typealias GetProcess = @convention(c) (pid_t, UnsafeMutablePointer<ProcessSerialNumber>) -> OSStatus
+    private typealias PostRecord = @convention(c) (UnsafeMutablePointer<ProcessSerialNumber>, UnsafePointer<UInt8>) -> OSStatus
+
+    private static let functions: (GetProcess, PostRecord)? = {
+        guard let library = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_LAZY),
+              let getProcess = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "GetProcessForPID"),
+              let postRecord = dlsym(library, "SLPSPostEventRecordTo") else { return nil }
+        return (unsafeBitCast(getProcess, to: GetProcess.self), unsafeBitCast(postRecord, to: PostRecord.self))
+    }()
+
+    let pid: pid_t
+    let windowID: CGWindowID
+    let foregroundPID: pid_t
+    private let process: ProcessSerialNumber
+    private let postRecord: PostRecord
+
+    init?(pid: pid_t, windowID: CGWindowID, foregroundPID: pid_t) {
+        guard let (getProcess, postRecord) = Self.functions else { return nil }
+        var process = ProcessSerialNumber()
+        guard getProcess(pid, &process) == noErr else { return nil }
+
+        self.pid = pid
+        self.windowID = windowID
+        self.foregroundPID = foregroundPID
+        self.process = process
+        self.postRecord = postRecord
+
+        guard sendRecord(type: 0x0d, activation: 1) else { return nil }
+        guard sendRecord(type: 1, keyWindow: true), sendRecord(type: 2, keyWindow: true) else {
+            release()
+            return nil
+        }
+    }
+
+    func release() {
+        // 如果用户已经切回目标应用，保留系统随后建立的前台焦点。
+        if NSWorkspace.shared.frontmostApplication?.processIdentifier != pid {
+            _ = sendRecord(type: 0x0d, activation: 2)
+        }
+    }
+
+    private func sendRecord(type: UInt8, keyWindow: Bool = false, activation: UInt8 = 0) -> Bool {
+        // SkyLight 事件记录只投给目标进程，让其处理输入而无需提升窗口层级。
+        var record = [UInt8](repeating: 0, count: 0xf8)
+        record[0x04] = 0xf8
+        record[0x08] = type
+        record.replaceSubrange(0x20..<0x30, with: repeatElement(0xff, count: 16))
+        if keyWindow { record[0x3a] = 0x10 }
+        withUnsafeBytes(of: windowID.littleEndian) { record.replaceSubrange(0x3c..<0x40, with: $0) }
+        record[0x8a] = activation
+
+        var process = self.process
+        return record.withUnsafeBufferPointer { postRecord(&process, $0.baseAddress!) == noErr }
+    }
+}
+
+private enum ClickMode: Int {
+    case background, global, compatibility
+
+    var title: String {
+        switch self {
+        case .background: return "后台定向 (不抢鼠标)"
+        case .global: return "全局模拟 (兼容模式)"
+        case .compatibility: return "后台兼容"
+        }
+    }
+}
+
+private final class ClickRun {
+    enum State { case running, paused, stopped }
+
+    private let lock = NSLock()
+    private var currentState = State.running
+    let wake = DispatchSemaphore(value: 0)
+
+    var state: State { lock.withLock { currentState } }
+
+    func togglePause() -> State {
+        let state = lock.withLock {
+            if currentState != .stopped {
+                currentState = currentState == .paused ? .running : .paused
+            }
+            return currentState
+        }
+        wake.signal()
+        return state
+    }
+
+    func stop() {
+        lock.withLock { currentState = .stopped }
+        wake.signal()
+    }
+}
+
 // MARK: - 透明穿透纯红 1px 细线准星标记
 final class MarkerView: NSView {
     override func draw(_ dirtyRect: NSRect) {
@@ -259,10 +354,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var relY: CGFloat = 0
 
     // 运行状态
-    private var isRunning = false
-    private var isPaused = false
-    private var clickCount: Int64 = 0
-    private var wakeSem = DispatchSemaphore(value: 0)
+    private let clickQueue = DispatchQueue(label: "com.nogeo.bgclicker.clicks", qos: .userInteractive)
+    private var activeRun: ClickRun?
+    private var isTerminating = false
 
     // UI 控件
     private var lblProcess: NSTextField!
@@ -321,8 +415,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    func applicationWillTerminate(_ notification: Notification) {
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        isTerminating = true
         stopClicking(reason: "程序退出")
+        // 等待正在进行的抬起事件和后台窗口状态清理，再退出进程。
+        clickQueue.async {
+            DispatchQueue.main.async { sender.reply(toApplicationShouldTerminate: true) }
+        }
+        return .terminateLater
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
         hotKeys?.unregisterAll()
         markerTimer?.invalidate()
         pickTimer?.invalidate()
@@ -408,7 +511,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         sc.addSubview(makeLabel("模式:", frame: NSRect(x: 196, y: 52, width: 42, height: 20), size: 12.5))
         popMode = NSPopUpButton(frame: NSRect(x: 240, y: 48, width: 162, height: 26), pullsDown: false)
-        popMode.addItems(withTitles: ["后台定向 (不抢鼠标)", "全局模拟 (兼容模式)"])
+        popMode.addItems(withTitles: [ClickMode.background.title, ClickMode.global.title, ClickMode.compatibility.title])
         sc.addSubview(popMode)
 
         chkTopMost = NSButton(checkboxWithTitle: "窗口置顶", target: self, action: #selector(onTopMostChanged))
@@ -564,7 +667,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         syncMarkerAndPermission()
 
-        if !isRunning {
+        if activeRun == nil {
             setStatus("已锁定目标，按 F9 开始连点", color: .systemGreen)
         }
     }
@@ -603,6 +706,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     // MARK: - 连点启停控制
     private func toggleStartPause() {
+        guard !isTerminating else { return }
         if currentTarget() == nil {
             setStatus("尚未锁定有效目标，请先指到目标按 F8", color: .systemRed)
             return
@@ -614,18 +718,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return
         }
 
-        if !isRunning {
+        guard let run = activeRun else {
             startClicking()
+            return
+        }
+        if run.togglePause() == .paused {
+            btnStartPause.title = "继续 (F9)"
+            setStatus("已暂停（按 F9 继续）", color: .systemOrange)
         } else {
-            isPaused.toggle()
-            wakeSem.signal()
-            if isPaused {
-                btnStartPause.title = "继续 (F9)"
-                setStatus("已暂停（按 F9 继续）", color: .systemOrange)
-            } else {
-                btnStartPause.title = "暂停 (F9)"
-                setStatus("运行中...", color: .systemGreen)
-            }
+            btnStartPause.title = "暂停 (F9)"
+            setStatus("运行中...", color: .systemGreen)
         }
     }
 
@@ -635,36 +737,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let holdMs     = max(0, Int(txtHold.stringValue) ?? 10)
         let maxCount   = max(0, Int64(txtCount.stringValue) ?? 0)
         let rightBtn   = (popButton.indexOfSelectedItem == 1)
-        let globalMode = (popMode.indexOfSelectedItem == 1)
+        let mode = ClickMode(rawValue: popMode.indexOfSelectedItem) ?? .background
 
-        isRunning = true
-        isPaused = false
-        clickCount = 0
+        let run = ClickRun()
+        activeRun = run
         lblClicks.stringValue = "已发送：0 次"
         btnStartPause.title = "暂停 (F9)"
         btnStop.isEnabled = true
         setEditable(false)
-        setStatus(globalMode ? "运行中（全局模拟模式）" : "运行中（后台定向，不抢鼠标）", color: .systemGreen)
+        setStatus("运行中 · \(mode.title)", color: .systemGreen)
 
-        DispatchQueue.global(qos: .userInteractive).async { [weak self] in
-            self?.workerLoop(intervalMs: intervalMs, jitterMs: jitterMs, holdMs: holdMs,
-                             maxCount: maxCount, rightBtn: rightBtn, globalMode: globalMode)
+        clickQueue.async { [weak self] in
+            self?.workerLoop(run: run, intervalMs: intervalMs, jitterMs: jitterMs, holdMs: holdMs,
+                             maxCount: maxCount, rightBtn: rightBtn, mode: mode)
         }
     }
 
     private func stopClicking(reason: String) {
-        if !isRunning { return }
-        isRunning = false
-        isPaused = false
-        wakeSem.signal()
-
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            self.btnStartPause.title = "开始 (F9)"
-            self.btnStop.isEnabled = false
-            self.setEditable(true)
-            self.setStatus(reason, color: .secondaryLabelColor)
-        }
+        guard let run = activeRun else { return }
+        run.stop()
+        activeRun = nil
+        btnStartPause.title = "开始 (F9)"
+        btnStop.isEnabled = false
+        setEditable(true)
+        setStatus(reason, color: .secondaryLabelColor)
     }
 
     private func setEditable(_ enabled: Bool) {
@@ -681,30 +777,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         lblStatus.textColor = color
     }
 
-    private func workerLoop(intervalMs: Int, jitterMs: Int, holdMs: Int,
-                            maxCount: Int64, rightBtn: Bool, globalMode: Bool) {
+    private func workerLoop(run: ClickRun, intervalMs: Int, jitterMs: Int, holdMs: Int,
+                            maxCount: Int64, rightBtn: Bool, mode: ClickMode) {
+        let globalMode = mode == .global
         let downType: CGEventType = rightBtn ? .rightMouseDown : .leftMouseDown
         let upType: CGEventType = rightBtn ? .rightMouseUp : .leftMouseUp
         let btn: CGMouseButton = rightBtn ? .right : .left
         let source = globalMode ? CGEventSource(stateID: .hidSystemState) : nil
 
-        while isRunning {
-            if isPaused {
-                _ = wakeSem.wait(timeout: .now() + .milliseconds(100))
+        var count: Int64 = 0
+        var focus: BackgroundWindowFocus?
+        func releaseFocus() {
+            guard let current = focus else { return }
+            // 让游戏渲染层有时间处理最后发出的抬起事件。
+            Thread.sleep(forTimeInterval: 0.05)
+            current.release()
+            focus = nil
+        }
+        defer { releaseFocus() }
+
+        func finish(_ reason: String) {
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.activeRun === run else { return }
+                self.stopClicking(reason: reason)
+            }
+        }
+
+        while run.state != .stopped {
+            if run.state == .paused {
+                releaseFocus()
+                run.wake.wait()
                 continue
             }
 
             guard let target = currentTarget() else {
-                stopClicking(reason: "目标窗口已关闭，自动停止")
+                finish("目标窗口已关闭，自动停止")
                 break
             }
+
+            if mode == .compatibility, let foregroundPID = NSWorkspace.shared.frontmostApplication?.processIdentifier {
+                if focus?.pid != target.pid || focus?.windowID != target.windowID || focus?.foregroundPID != foregroundPID {
+                    releaseFocus()
+                    if foregroundPID != target.pid {
+                        guard let newFocus = BackgroundWindowFocus(pid: target.pid, windowID: target.windowID,
+                                                                   foregroundPID: foregroundPID) else {
+                            finish("无法启用后台兼容，请换用其他模式")
+                            break
+                        }
+                        focus = newFocus
+                        _ = run.wake.wait(timeout: .now() + .milliseconds(10))
+                    }
+                }
+            }
+            guard run.state == .running else { continue }
 
             func makeEvent(_ type: CGEventType) -> CGEvent? {
                 CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: target.screenPoint, mouseButton: btn)
             }
 
             guard let down = makeEvent(downType), let up = makeEvent(upType) else {
-                stopClicking(reason: "无法创建鼠标事件，已停止")
+                finish("无法创建鼠标事件，已停止")
                 break
             }
             let group = Int64.random(in: 1...Int64(Int32.max))
@@ -724,20 +856,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             if let move = makeEvent(.mouseMoved) { post(move) }
             post(down)
             if holdMs > 0 {
-                _ = wakeSem.wait(timeout: .now() + .milliseconds(holdMs))
+                _ = run.wake.wait(timeout: .now() + .milliseconds(holdMs))
             }
             post(up)
 
-            if !isRunning { break }
+            if run.state == .stopped { break }
 
-            clickCount += 1
-            let currentCount = clickCount
+            count += 1
+            let currentCount = count
             DispatchQueue.main.async { [weak self] in
-                self?.lblClicks.stringValue = "已发送：\(currentCount) 次"
+                guard let self, self.activeRun === run else { return }
+                self.lblClicks.stringValue = "已发送：\(currentCount) 次"
             }
 
             if maxCount > 0 && currentCount >= maxCount {
-                stopClicking(reason: "已完成预定次数 (\(maxCount) 次)")
+                finish("已完成预定次数 (\(maxCount) 次)")
                 break
             }
 
@@ -747,7 +880,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
             if delay < 5 { delay = 5 }
 
-            _ = wakeSem.wait(timeout: .now() + .milliseconds(delay))
+            _ = run.wake.wait(timeout: .now() + .milliseconds(delay))
         }
     }
 }
