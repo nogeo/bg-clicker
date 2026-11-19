@@ -341,6 +341,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private static let hkF8: UInt32  = 1
     private static let hkF9: UInt32  = 2
     private static let hkF10: UInt32 = 3
+    private static let modeDefaultsKey = "selectedClickMode"
 
     private var window: NSWindow!
     private var markerWindow: MarkerWindow!
@@ -512,6 +513,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         sc.addSubview(makeLabel("模式:", frame: NSRect(x: 196, y: 52, width: 42, height: 20), size: 12.5))
         popMode = NSPopUpButton(frame: NSRect(x: 240, y: 48, width: 162, height: 26), pullsDown: false)
         popMode.addItems(withTitles: [ClickMode.background.title, ClickMode.global.title, ClickMode.compatibility.title])
+        let savedMode = UserDefaults.standard.object(forKey: Self.modeDefaultsKey) as? Int
+        let initialMode = savedMode.flatMap(ClickMode.init(rawValue:)) ?? .compatibility
+        popMode.selectItem(at: initialMode.rawValue)
+        popMode.target = self
+        popMode.action = #selector(onModeChanged)
         sc.addSubview(popMode)
 
         chkTopMost = NSButton(checkboxWithTitle: "窗口置顶", target: self, action: #selector(onTopMostChanged))
@@ -599,6 +605,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     // MARK: - 界面交互
+    @objc private func onModeChanged() {
+        UserDefaults.standard.set(popMode.indexOfSelectedItem, forKey: Self.modeDefaultsKey)
+    }
+
     @objc private func onTopMostChanged() {
         window.level = (chkTopMost.state == .on) ? .floating : .normal
     }

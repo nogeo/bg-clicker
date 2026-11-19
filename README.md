@@ -2,7 +2,7 @@
 
 轻量级原生桌面连点工具，零第三方依赖：
 - **Windows 版**（`BgClicker.cs`）：基于 Win32 `PostMessageW` 向目标子窗口投递点击消息，使用系统自带 `.NET Framework 4.x` 编译，单文件 `.exe` 仅约 20 KB。
-- **macOS 版**（`macos/BgClicker.swift`）：基于 AppKit + CoreGraphics `CGEventPostToPid` 定向进程投递（同时提供「全局模拟」兼容模式）+ Carbon 全局热键，使用系统 `swiftc` 编译为原生 `BgClicker.app`。
+- **macOS 版**（`macos/BgClicker.swift`）：基于 AppKit + CoreGraphics `CGEventPostToPid` 定向进程投递（提供「后台兼容」「后台定向 (不抢鼠标)」「全局模拟 (兼容模式)」三种模式）+ Carbon 全局热键，使用系统 `swiftc` 编译为原生 `BgClicker.app`。
 
 ## 功能特点
 
@@ -43,7 +43,7 @@ open macos/BgClicker.app
 ## 注意事项
 
 - **Windows**：如果目标程序以管理员身份运行，请右键 `BgClicker.exe` 选择「以管理员身份运行」（UIPI 限制）；部分 UWP 应用（如 Win10/11 计算器）或 DirectInput 游戏不响应 `PostMessage`。
-- **macOS**：默认「后台定向（`CGEventPostToPid`）」模式不抢物理鼠标；如遇部分游戏/小程序在失焦状态下忽略后台事件，可在界面「模式」中一键切换为「全局模拟（兼容模式）」。
+- **macOS**：默认使用「后台兼容」模式（支持微信小程序游戏等失焦忽略普通后台事件的应用，并会自动记住上次选择的模式）；也可在界面「模式」中切换为「后台定向 (不抢鼠标)」或「全局模拟 (兼容模式)」。
 
 ## License
 
