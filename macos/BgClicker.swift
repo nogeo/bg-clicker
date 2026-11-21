@@ -303,6 +303,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var popButton: NSPopUpButton!
     private var chkTopMost: NSButton!
     private var chkShowMarker: NSButton!
+    private var chkCommandClick: NSButton!
 
     private var btnPick: NSButton!
     private var btnStartPause: NSButton!
@@ -378,7 +379,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func buildWindow() {
         let width: CGFloat = 450
-        let height: CGFloat = 438
+        let height: CGFloat = 470
         window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: width, height: height),
             styleMask: [.titled, .closable, .miniaturizable],
@@ -395,15 +396,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.contentView = root
 
         // 顶部权限条
-        lblPerm = makeLabel("辅助功能权限：检查中...", frame: NSRect(x: 16, y: 406, width: 310, height: 20), size: 12)
+        lblPerm = makeLabel("辅助功能权限：检查中...", frame: NSRect(x: 16, y: 438, width: 310, height: 20), size: 12)
         btnPerm = NSButton(title: "去授权", target: self, action: #selector(openAccessibilitySettings))
         btnPerm.bezelStyle = .rounded
-        btnPerm.frame = NSRect(x: 356, y: 402, width: 78, height: 26)
+        btnPerm.frame = NSRect(x: 356, y: 434, width: 78, height: 26)
         root.addSubview(lblPerm)
         root.addSubview(btnPerm)
 
         // 1. 目标窗口卡片
-        let targetBox = NSBox(frame: NSRect(x: 14, y: 282, width: 422, height: 114))
+        let targetBox = NSBox(frame: NSRect(x: 14, y: 314, width: 422, height: 114))
         targetBox.title = "目标窗口（鼠标指到目标位置按 F8 锁定）"
         lblProcess = makeLabel("进程：未锁定", frame: NSRect(x: 10, y: 66, width: 396, height: 18), size: 12.5)
         lblWindow  = makeLabel("窗口：-", frame: NSRect(x: 10, y: 42, width: 396, height: 18), size: 12.5)
@@ -414,30 +415,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         root.addSubview(targetBox)
 
         // 2. 参数设置卡片
-        let settingsBox = NSBox(frame: NSRect(x: 14, y: 136, width: 422, height: 136))
+        let settingsBox = NSBox(frame: NSRect(x: 14, y: 136, width: 422, height: 168))
         settingsBox.title = "连点参数"
         let sc = settingsBox.contentView!
 
-        sc.addSubview(makeLabel("间隔 (ms):", frame: NSRect(x: 10, y: 88, width: 76, height: 20), size: 12.5))
-        txtInterval = makeInput("50", frame: NSRect(x: 88, y: 86, width: 90, height: 24))
+        sc.addSubview(makeLabel("间隔 (ms):", frame: NSRect(x: 10, y: 120, width: 76, height: 20), size: 12.5))
+        txtInterval = makeInput("50", frame: NSRect(x: 88, y: 118, width: 90, height: 24))
         sc.addSubview(txtInterval)
 
-        sc.addSubview(makeLabel("随机抖动 (±ms):", frame: NSRect(x: 196, y: 88, width: 106, height: 20), size: 12.5))
-        txtJitter = makeInput("0", frame: NSRect(x: 306, y: 86, width: 92, height: 24))
+        sc.addSubview(makeLabel("随机抖动 (±ms):", frame: NSRect(x: 196, y: 120, width: 106, height: 20), size: 12.5))
+        txtJitter = makeInput("0", frame: NSRect(x: 306, y: 118, width: 92, height: 24))
         sc.addSubview(txtJitter)
 
-        sc.addSubview(makeLabel("按住 (ms):", frame: NSRect(x: 10, y: 54, width: 76, height: 20), size: 12.5))
-        txtHold = makeInput("10", frame: NSRect(x: 88, y: 52, width: 90, height: 24))
+        sc.addSubview(makeLabel("按住 (ms):", frame: NSRect(x: 10, y: 86, width: 76, height: 20), size: 12.5))
+        txtHold = makeInput("10", frame: NSRect(x: 88, y: 84, width: 90, height: 24))
         sc.addSubview(txtHold)
 
-        sc.addSubview(makeLabel("次数 (0=无限):", frame: NSRect(x: 196, y: 54, width: 106, height: 20), size: 12.5))
-        txtCount = makeInput("0", frame: NSRect(x: 306, y: 52, width: 92, height: 24))
+        sc.addSubview(makeLabel("次数 (0=无限):", frame: NSRect(x: 196, y: 86, width: 106, height: 20), size: 12.5))
+        txtCount = makeInput("0", frame: NSRect(x: 306, y: 84, width: 92, height: 24))
         sc.addSubview(txtCount)
 
-        sc.addSubview(makeLabel("按键:", frame: NSRect(x: 10, y: 18, width: 76, height: 20), size: 12.5))
-        popButton = NSPopUpButton(frame: NSRect(x: 86, y: 14, width: 96, height: 26), pullsDown: false)
+        sc.addSubview(makeLabel("按键:", frame: NSRect(x: 10, y: 50, width: 76, height: 20), size: 12.5))
+        popButton = NSPopUpButton(frame: NSRect(x: 86, y: 46, width: 96, height: 26), pullsDown: false)
         popButton.addItems(withTitles: ["鼠标左键", "鼠标右键"])
         sc.addSubview(popButton)
+
+        chkCommandClick = NSButton(checkboxWithTitle: "Command 点击", target: nil, action: nil)
+        chkCommandClick.frame = NSRect(x: 196, y: 48, width: 202, height: 22)
+        chkCommandClick.state = .on
+        chkCommandClick.toolTip = "在发送给目标窗口的事件上附加 Command 修饰键。"
+        sc.addSubview(chkCommandClick)
 
         chkTopMost = NSButton(checkboxWithTitle: "窗口置顶", target: self, action: #selector(onTopMostChanged))
         chkTopMost.frame = NSRect(x: 196, y: 16, width: 96, height: 22)
@@ -662,6 +669,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let holdMs     = max(0, Int(txtHold.stringValue) ?? 10)
         let maxCount   = max(0, Int64(txtCount.stringValue) ?? 0)
         let rightBtn   = (popButton.indexOfSelectedItem == 1)
+        let commandClick = chkCommandClick.state == .on
 
         let run = ClickRun()
         activeRun = run
@@ -673,7 +681,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         clickQueue.async { [weak self] in
             self?.workerLoop(run: run, intervalMs: intervalMs, jitterMs: jitterMs, holdMs: holdMs,
-                             maxCount: maxCount, rightBtn: rightBtn)
+                             maxCount: maxCount, rightBtn: rightBtn, commandClick: commandClick)
         }
     }
 
@@ -693,6 +701,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         txtHold.isEnabled     = enabled
         txtCount.isEnabled    = enabled
         popButton.isEnabled   = enabled
+        chkCommandClick.isEnabled = enabled
     }
 
     private func setStatus(_ text: String, color: NSColor) {
@@ -701,7 +710,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func workerLoop(run: ClickRun, intervalMs: Int, jitterMs: Int, holdMs: Int,
-                            maxCount: Int64, rightBtn: Bool) {
+                            maxCount: Int64, rightBtn: Bool, commandClick: Bool) {
         let downType: CGEventType = rightBtn ? .rightMouseDown : .leftMouseDown
         let upType: CGEventType = rightBtn ? .rightMouseUp : .leftMouseUp
         let btn: CGMouseButton = rightBtn ? .right : .left
@@ -740,6 +749,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 event.timestamp = DispatchTime.now().uptimeNanoseconds
                 BackgroundMouseEvent.stamp(event, pid: target.pid, windowID: target.windowID,
                                            windowPoint: target.windowPoint, group: group)
+                if commandClick { event.flags.insert(.maskCommand) }
                 event.postToPid(target.pid)
             }
 
